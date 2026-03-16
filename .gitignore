@@ -1,0 +1,5 @@
+# Ignore compiled binary
+a.out
+
+# Ignore test file
+test_connection_file.cpp

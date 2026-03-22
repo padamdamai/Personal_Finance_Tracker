@@ -1,7 +1,35 @@
 #include <iostream>
 #include <pqxx/pqxx>
+#include <openssl/sha.h>
+#include <sstream>
+#include <iomanip>
+#include <fstream>
 
 using namespace std;
+
+// ---------------- SIMPLE ENCRYPTION ----------------
+string encryptDecrypt(string text)
+{
+    char key = 'K'; // secret key
+
+    for (int i = 0; i < text.size(); i++)
+        text[i] = text[i] ^ key;
+
+    return text;
+}
+
+// ---------------- HASH FUNCTION ----------------
+string hashPassword(const string &password)
+{
+    unsigned char hash[SHA256_DIGEST_LENGTH];
+    SHA256((unsigned char*)password.c_str(), password.size(), hash);
+
+    stringstream ss;
+    for(int i = 0; i < SHA256_DIGEST_LENGTH; i++)
+        ss << hex << setw(2) << setfill('0') << (int)hash[i];
+
+    return ss.str();
+}
 
 // ---------------- REGISTER ----------------
 void registerUser(pqxx::connection &C)
@@ -12,8 +40,10 @@ void registerUser(pqxx::connection &C)
     cout << "Enter password: ";
     cin >> password;
 
+    string hashed = hashPassword(password);  
+
     pqxx::work W(C);
-    W.exec_params("INSERT INTO users(username,password_hash) VALUES($1,$2)", username, password);
+    W.exec_params("INSERT INTO users(username,password_hash) VALUES($1,$2)", username, hashed);
     W.commit();
 
     cout << "Registration Successful!\n";
@@ -30,10 +60,12 @@ bool loginUser(pqxx::connection &C, int &user_id)
     cout << "Enter password: ";
     cin >> password;
 
+    string hashed = hashPassword(password); 
+
     pqxx::work W(C);
     pqxx::result R = W.exec_params(
         "SELECT user_id FROM users WHERE username=$1 AND password_hash=$2",
-        username, password
+        username, hashed
     );
 
     if (R.size() == 1)
@@ -64,6 +96,7 @@ void addIncome(pqxx::connection &C, int user_id)
     cin.ignore();
     cout << "Description: ";
     getline(cin, description);
+    description = encryptDecrypt(description);
 
     cout << "Date (YYYY-MM-DD): ";
     cin >> date;
@@ -94,6 +127,7 @@ void addExpense(pqxx::connection &C, int user_id)
     cin.ignore();
     cout << "Description: ";
     getline(cin, description);
+    description = encryptDecrypt(description);
 
     cout << "Date (YYYY-MM-DD): ";
     cin >> date;
@@ -104,9 +138,75 @@ void addExpense(pqxx::connection &C, int user_id)
         "VALUES($1,'expense',$2,$3,$4,$5)",
         user_id, amount, category, description, date
     );
+
+    // BUDGET CHECK
+    pqxx::result R = W.exec_params(
+        "SELECT limit_amount FROM budgets WHERE user_id=$1 AND category=$2",
+        user_id, category
+    );
+
+    if (R.size() == 1)
+    {
+        double limit = R[0][0].as<double>();
+
+        pqxx::result spent = W.exec_params(
+            "SELECT COALESCE(SUM(amount),0) FROM transactions "
+            "WHERE user_id=$1 AND category=$2 AND type='expense'",
+            user_id, category
+        );
+
+        double total = spent[0][0].as<double>();
+
+        if (total > limit)
+            cout << "⚠ Budget exceeded for " << category << "!\n";
+    }
+
     W.commit();
 
     cout << "Expense added!\n";
+}
+
+// ---------------- CATEGORY EXPENSE ----------------
+void categoryExpense(pqxx::connection &C, int user_id)
+{
+    pqxx::work W(C);
+
+    pqxx::result R = W.exec_params(
+        "SELECT category, SUM(amount) FROM transactions "
+        "WHERE user_id=$1 AND type='expense' GROUP BY category",
+        user_id
+    );
+
+    cout << "\n--- Category Expenses ---\n";
+
+    for (auto row : R)
+    {
+        cout << row[0].c_str() << " : " << row[1].as<double>() << endl;
+    }
+}
+
+// ---------------- SET BUDGET ----------------
+void setBudget(pqxx::connection &C, int user_id)
+{
+    string category;
+    double limit;
+
+    cout << "Enter category: ";
+    cin >> category;
+
+    cout << "Enter budget limit: ";
+    cin >> limit;
+
+    pqxx::work W(C);
+
+    W.exec_params(
+        "INSERT INTO budgets(user_id,category,limit_amount) VALUES($1,$2,$3)",
+        user_id, category, limit
+    );
+
+    W.commit();
+
+    cout << "Budget set successfully!\n";
 }
 
 // ---------------- VIEW TRANSACTIONS ----------------
@@ -128,7 +228,7 @@ void viewTransactions(pqxx::connection &C, int user_id)
              << " | " << row[1].c_str()
              << " | " << row[2].as<double>()
              << " | " << row[3].c_str()
-             << " | " << row[4].c_str()
+             << " | " << encryptDecrypt(row[4].c_str())
              << " | " << row[5].c_str()
              << endl;
     }
@@ -220,6 +320,45 @@ void monthlyReport(pqxx::connection &C, int user_id)
          << "\nSavings: " << income - expense << endl;
 }
 
+// ---------------- EXPORT CSV ----------------
+void exportCSV(pqxx::connection &C, int user_id)
+{
+    pqxx::work W(C);
+
+    pqxx::result R = W.exec_params(
+        "SELECT transaction_date, type, amount, category, description "
+        "FROM transactions WHERE user_id=$1",
+        user_id
+    );
+
+    ofstream file("report.csv");
+
+    file << "Date,Type,Amount,Category,Description\n";
+
+    for (auto row : R)
+    {
+        string desc = encryptDecrypt(row[4].c_str());
+        
+        // Escape quotes inside description
+        for (size_t i = 0; i < desc.size(); i++)
+        {
+            if (desc[i] == '"')
+                desc.insert(i++, "\"");
+        }
+        
+        file << row[0].c_str() << ","
+            << row[1].c_str() << ","
+            << row[2].as<double>() << ","
+            << row[3].c_str() << ","
+            << "\"" << desc << "\"" << "\n";
+        
+    }
+
+    file.close();
+
+    cout << "CSV Exported as report.csv\n";
+}
+
 // ---------------- DASHBOARD ----------------
 void dashboard(pqxx::connection &C, int user_id)
 {
@@ -235,7 +374,11 @@ void dashboard(pqxx::connection &C, int user_id)
         cout << "5 Delete Transaction\n";
         cout << "6 View Balance\n";
         cout << "7 Monthly Report\n";
-        cout << "8 Logout\n";
+        cout << "8 Category Expense\n"; 
+        cout << "9 Set Budget\n";         
+        cout << "10 Logout\n";
+        cout << "11 Export CSV\n";
+        cout << "12 Exit\n";
         cout << "Enter choice: ";
         cin >> choice;
 
@@ -248,7 +391,11 @@ void dashboard(pqxx::connection &C, int user_id)
             case 5: deleteTransaction(C, user_id); break;
             case 6: viewBalance(C, user_id); break;
             case 7: monthlyReport(C, user_id); break;
-            case 8: return;
+            case 8: categoryExpense(C, user_id); break;
+            case 9: setBudget(C, user_id); break;
+            case 10: return;
+            case 11: exportCSV(C, user_id); break;
+            case 12: exit(0);
             default: cout << "Invalid choice\n";
         }
     }
